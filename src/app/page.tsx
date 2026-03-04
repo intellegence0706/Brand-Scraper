@@ -138,7 +138,7 @@ export default function Home() {
             })}
           </div>
 
-          {/* Form */}
+          
           <form onSubmit={handleSubmit} style={{ display: "flex", gap: 12 }}>
             <input
               type="text"
