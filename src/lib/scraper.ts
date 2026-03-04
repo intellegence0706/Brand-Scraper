@@ -108,7 +108,6 @@ async function fetchExternalCss(html: string, baseUrl: string): Promise<string> 
 
   const results: string[] = [];
 
-  // Fetch up to 5 CSS files with a short timeout
   const urls = [...cssUrls].slice(0, 5);
   await Promise.allSettled(
     urls.map(async (cssHref) => {
