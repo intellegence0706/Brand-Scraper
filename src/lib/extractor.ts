@@ -1,9 +1,9 @@
-import { BrandResult, FontInfo } from "@/api/jobs";
+import { BrandResult, FontInfo, BusinessType } from "@/api/jobs";
 import type { ScrapeResult } from "./scraper";
 
 // ── Logo extraction ──────────────────────────────────────────────
 
-function extractLogo(html: string, baseUrl: string, ogImageFromMeta?: string): string | null {
+function extractLogo(html: string, baseUrl: string, businessType: BusinessType, ogImageFromMeta?: string): string | null {
   const candidates: { url: string; score: number }[] = [];
 
   if (ogImageFromMeta) {
@@ -62,7 +62,41 @@ function extractLogo(html: string, baseUrl: string, ogImageFromMeta?: string): s
     if (classMatch && /logo/i.test(classMatch[1])) score += 5;
     const idMatch = tag.match(/id=["']([^"']+)["']/i);
     if (idMatch && /logo/i.test(idMatch[1])) score += 5;
+
+    // Business-type-specific logo scoring adjustments
+    if (businessType === "products") {
+      // E-commerce: boost logos near cart/shop elements
+      if (/cart|shop|store|product/i.test(tagLower)) score += 3;
+      // Logos in nav/header are strong signals for e-commerce
+      if (/nav|header/i.test(tagLower)) score += 2;
+    } else if (businessType === "saas") {
+      // SaaS sites favor SVG logos heavily
+      if (/\.svg/i.test(src)) score += 4;
+      // Inline SVG data URIs are common in SaaS
+      if (src.startsWith("data:image/svg")) score += 3;
+    } else if (businessType === "services") {
+      // Services sites often use text-based logos or wordmarks
+      // Boost images with "wordmark" or "text" in attributes
+      if (/wordmark|text[-_]?logo|logotype/i.test(tagLower)) score += 5;
+      // Header images are the strongest signal for services
+      if (/header/i.test(tagLower)) score += 3;
+    }
+
     if (score > 0) candidates.push({ url: src, score });
+  }
+
+  // SaaS: also look for inline <svg> elements in the header area that might be logos
+  if (businessType === "saas") {
+    const headerSvgRe = /<(?:header|nav)[^>]*>[\s\S]{0,2000}?<svg[^>]*>([\s\S]*?)<\/svg>/gi;
+    let svgMatch;
+    while ((svgMatch = headerSvgRe.exec(html)) !== null) {
+      // Found an SVG in header/nav — encode as data URI candidate
+      const svgContent = svgMatch[0].match(/<svg[^>]*>[\s\S]*?<\/svg>/i);
+      if (svgContent) {
+        const encoded = `data:image/svg+xml,${encodeURIComponent(svgContent[0])}`;
+        candidates.push({ url: encoded, score: 9 });
+      }
+    }
   }
 
   if (!candidates.length) return null;
@@ -120,11 +154,6 @@ function getSaturation(hex: string): number {
   return (max - min) / (l > 0.5 ? (2 - max - min) : (max + min));
 }
 
-function isNearBlackOrWhite(hex: string): boolean {
-  const b = getBrightness(hex);
-  return b < 15 || b > 245;
-}
-
 interface ColorEntry { hex: string; count: number; context: string }
 
 function collectColors(css: string, context: string, entries: ColorEntry[]) {
@@ -156,7 +185,7 @@ interface ColorCategories {
   background: string[];
 }
 
-function extractColors(html: string, externalCss: string): ColorCategories {
+function extractColors(html: string, externalCss: string, businessType: BusinessType): ColorCategories {
   const entries: ColorEntry[] = [];
 
   // Inline CSS from HTML
@@ -205,6 +234,43 @@ function extractColors(html: string, externalCss: string): ColorCategories {
     if (hex) entries.push({ hex, count: 2, context: "background" });
   }
 
+  // Business-type-specific color context boosting
+  if (businessType === "products") {
+    // E-commerce: boost colors from CTA/buy buttons and price elements
+    const ctaRe = /(?:add[-_]?to[-_]?cart|buy[-_]?now|checkout|price|sale|discount)[^}]*?(?:background(?:-color)?|color)\s*:\s*([^;}"]+)/gi;
+    while ((m = ctaRe.exec(allCss)) !== null) {
+      const hex = normalizeToHex(m[1].trim().split(/\s/)[0]);
+      if (hex) entries.push({ hex, count: 15, context: "product-cta" });
+    }
+    // Boost colors from elements with shopping-related classes
+    const shopClassRe = /\.(?:cart|product|price|sale|badge|btn[-_]?buy)[^{]*\{([^}]+)\}/gi;
+    while ((m = shopClassRe.exec(allCss)) !== null) {
+      collectColors(m[1], "product-cta", entries);
+    }
+  } else if (businessType === "saas") {
+    // SaaS: boost CTA/signup button colors and gradient endpoints
+    const saasCtaRe = /(?:sign[-_]?up|get[-_]?started|free[-_]?trial|cta|hero)[^}]*?(?:background(?:-color)?|color)\s*:\s*([^;}"]+)/gi;
+    while ((m = saasCtaRe.exec(allCss)) !== null) {
+      const hex = normalizeToHex(m[1].trim().split(/\s/)[0]);
+      if (hex) entries.push({ hex, count: 15, context: "saas-cta" });
+    }
+    // Extract gradient endpoints as accent colors
+    const gradientRe = /linear-gradient\s*\([^)]*?(#[0-9a-fA-F]{3,8})[^)]*?(#[0-9a-fA-F]{3,8})/gi;
+    while ((m = gradientRe.exec(allCss)) !== null) {
+      const hex1 = normalizeToHex(m[1]);
+      const hex2 = normalizeToHex(m[2]);
+      if (hex1) entries.push({ hex: hex1, count: 8, context: "gradient-endpoint" });
+      if (hex2) entries.push({ hex: hex2, count: 8, context: "gradient-endpoint" });
+    }
+  } else if (businessType === "services") {
+    // Services: boost colors from nav, footer, and contact sections
+    const servicesRe = /(?:nav|footer|contact|about)[^}]*?(?:background(?:-color)?|color)\s*:\s*([^;}"]+)/gi;
+    while ((m = servicesRe.exec(allCss)) !== null) {
+      const hex = normalizeToHex(m[1].trim().split(/\s/)[0]);
+      if (hex) entries.push({ hex, count: 12, context: "services-structural" });
+    }
+  }
+
   // Aggregate by hex
   const colorMap = new Map<string, { count: number; contexts: Set<string> }>();
   for (const e of entries) {
@@ -216,6 +282,16 @@ function extractColors(html: string, externalCss: string): ColorCategories {
       colorMap.set(e.hex, { count: e.count, contexts: new Set([e.context]) });
     }
   }
+
+  // Category limits vary by business type
+  const limits = businessType === "products"
+    ? { primary: 5, secondary: 5, accent: 4, background: 4 }
+    : businessType === "services"
+    ? { primary: 3, secondary: 3, accent: 2, background: 3 }
+    : { primary: 4, secondary: 4, accent: 3, background: 3 }; // saas
+
+  // Saturation threshold for "gray" — services sites use more muted tones
+  const grayThreshold = businessType === "services" ? 0.08 : 0.1;
 
   // Categorize
   const backgrounds: string[] = [];
@@ -233,18 +309,33 @@ function extractColors(html: string, externalCss: string): ColorCategories {
 
     // Background colors: very dark or very light
     if (brightness < 20 || brightness > 235) {
-      if (backgrounds.length < 3) { backgrounds.push(hex); seen.add(hex); }
+      if (backgrounds.length < limits.background) { backgrounds.push(hex); seen.add(hex); }
       continue;
     }
 
-    // Accent: from accent-named vars, or high saturation + low frequency
-    if (info.contexts.has("accent-var")) {
-      if (accents.length < 3) { accents.push(hex); seen.add(hex); continue; }
+    // Accent: from accent-named vars or gradient endpoints (SaaS)
+    if (info.contexts.has("accent-var") || (businessType === "saas" && info.contexts.has("gradient-endpoint"))) {
+      if (accents.length < limits.accent) { accents.push(hex); seen.add(hex); continue; }
+    }
+
+    // Products: CTA colors are strong primary signals
+    if (businessType === "products" && info.contexts.has("product-cta")) {
+      if (primaries.length < limits.primary) { primaries.push(hex); seen.add(hex); continue; }
+    }
+
+    // SaaS: CTA colors are strong primary signals
+    if (businessType === "saas" && info.contexts.has("saas-cta")) {
+      if (primaries.length < limits.primary) { primaries.push(hex); seen.add(hex); continue; }
+    }
+
+    // Services: structural colors are primary signals
+    if (businessType === "services" && info.contexts.has("services-structural")) {
+      if (primaries.length < limits.primary) { primaries.push(hex); seen.add(hex); continue; }
     }
 
     // Background from context
     if (info.contexts.has("background") || info.contexts.has("bg-var")) {
-      if (saturation < 0.15 && backgrounds.length < 3) {
+      if (saturation < 0.15 && backgrounds.length < limits.background) {
         backgrounds.push(hex); seen.add(hex); continue;
       }
     }
@@ -256,13 +347,13 @@ function extractColors(html: string, externalCss: string): ColorCategories {
     const brightness = getBrightness(hex);
     const saturation = getSaturation(hex);
     if (brightness < 20 || brightness > 235) continue;
-    if (saturation < 0.1) continue; // skip grays
+    if (saturation < grayThreshold) continue;
 
-    if (saturation > 0.6 && info.count <= 3 && accents.length < 3) {
+    if (saturation > 0.6 && info.count <= 3 && accents.length < limits.accent) {
       accents.push(hex); seen.add(hex);
-    } else if (primaries.length < 4) {
+    } else if (primaries.length < limits.primary) {
       primaries.push(hex); seen.add(hex);
-    } else if (secondaries.length < 4) {
+    } else if (secondaries.length < limits.secondary) {
       secondaries.push(hex); seen.add(hex);
     }
   }
@@ -287,11 +378,13 @@ function extractInlineCss(html: string): string {
 
 // ── Font extraction with weights ─────────────────────────────────
 
-function extractFonts(html: string, externalCss: string): FontInfo[] {
+function extractFonts(html: string, externalCss: string, businessType: BusinessType): FontInfo[] {
   const fontData = new Map<string, Set<string>>();
+  // Track where each font appears for business-type-aware ranking
+  const fontContexts = new Map<string, Set<string>>();
   const allCss = extractInlineCss(html) + "\n" + externalCss;
 
-  // font-family declarations — track which fonts are used
+  // font-family declarations — track which fonts are used and where
   let m;
   const ffRe = /font-family\s*:\s*([^;}"]+)/gi;
   while ((m = ffRe.exec(allCss)) !== null) {
@@ -299,7 +392,26 @@ function extractFonts(html: string, externalCss: string): FontInfo[] {
     for (const f of families) {
       if (f && !isGenericFont(f)) {
         if (!fontData.has(f)) fontData.set(f, new Set());
+        if (!fontContexts.has(f)) fontContexts.set(f, new Set());
       }
+    }
+  }
+
+  // Detect font contexts from CSS selectors
+  const selectorFontRe = /([^{}]+)\{[^}]*font-family\s*:\s*([^;}"]+)/gi;
+  while ((m = selectorFontRe.exec(allCss)) !== null) {
+    const selector = m[1].toLowerCase();
+    const families = m[2].split(",").map((f) => f.trim().replace(/^["']|["']$/g, "").trim());
+    for (const f of families) {
+      if (!f || isGenericFont(f)) continue;
+      if (!fontContexts.has(f)) fontContexts.set(f, new Set());
+      const ctx = fontContexts.get(f)!;
+      if (/h[1-3]|hero|heading|title|display/i.test(selector)) ctx.add("heading");
+      if (/body|paragraph|text|content|article/i.test(selector)) ctx.add("body");
+      if (/nav|menu|header/i.test(selector)) ctx.add("nav");
+      if (/price|product|item/i.test(selector)) ctx.add("product");
+      if (/testimonial|quote|review/i.test(selector)) ctx.add("testimonial");
+      if (/footer|contact/i.test(selector)) ctx.add("footer");
     }
   }
 
@@ -313,12 +425,12 @@ function extractFonts(html: string, externalCss: string): FontInfo[] {
     if (!family || isGenericFont(family)) continue;
 
     if (!fontData.has(family)) fontData.set(family, new Set());
+    if (!fontContexts.has(family)) fontContexts.set(family, new Set());
     const weights = fontData.get(family)!;
 
     const weightMatch = block.match(/font-weight\s*:\s*([^;}"]+)/i);
     if (weightMatch) {
       const val = weightMatch[1].trim();
-      // Handle ranges like "100 900" or single values
       if (/^\d+\s+\d+$/.test(val)) {
         const [lo, hi] = val.split(/\s+/).map(Number);
         for (const w of [100, 200, 300, 400, 500, 600, 700, 800, 900]) {
@@ -328,7 +440,7 @@ function extractFonts(html: string, externalCss: string): FontInfo[] {
         weights.add(normalizeWeight(val));
       }
     } else {
-      weights.add("400"); // default
+      weights.add("400");
     }
   }
 
@@ -342,10 +454,10 @@ function extractFonts(html: string, externalCss: string): FontInfo[] {
       const name = nameRaw.replace(/\+/g, " ").trim();
       if (!name || isGenericFont(name)) continue;
       if (!fontData.has(name)) fontData.set(name, new Set());
+      if (!fontContexts.has(name)) fontContexts.set(name, new Set());
       const weights = fontData.get(name)!;
 
       if (params) {
-        // Parse "wght@400;700" or "ital,wght@0,400;0,700;1,400"
         const wghtMatch = params.match(/(?:wght@|@)([\d;,]+)/);
         if (wghtMatch) {
           const vals = wghtMatch[1].split(";");
@@ -360,14 +472,46 @@ function extractFonts(html: string, externalCss: string): FontInfo[] {
     }
   }
 
-  // Sort by number of weights (more weights = more important font)
+  // Score fonts based on business type and context
+  const fontScores = new Map<string, number>();
+  for (const [family, weights] of fontData.entries()) {
+    let score = weights.size; // base: more weights = more important
+    const ctx = fontContexts.get(family) ?? new Set();
+
+    if (businessType === "products") {
+      // E-commerce: product titles and price fonts are key brand choices
+      if (ctx.has("product")) score += 10;
+      if (ctx.has("heading")) score += 5;
+      if (ctx.has("nav")) score += 3;
+    } else if (businessType === "saas") {
+      // SaaS: hero heading font is the most intentional brand choice
+      if (ctx.has("heading")) score += 10;
+      if (ctx.has("body")) score += 4;
+      if (ctx.has("nav")) score += 2;
+    } else if (businessType === "services") {
+      // Services: testimonial and heading fonts capture brand voice
+      if (ctx.has("testimonial")) score += 10;
+      if (ctx.has("heading")) score += 8;
+      if (ctx.has("footer")) score += 3;
+      // Serif fonts are more common and intentional in services
+      if (isSerifFont(family)) score += 4;
+    }
+  
+    fontScores.set(family, score);
+  }
+
   const sorted = [...fontData.entries()]
-    .sort((a, b) => b[1].size - a[1].size);
+    .sort((a, b) => (fontScores.get(b[0]) ?? 0) - (fontScores.get(a[0]) ?? 0));
 
   return sorted.slice(0, 10).map(([family, weights]) => ({
     family,
     weights: [...weights].sort((a, b) => Number(a) - Number(b)),
   }));
+}
+
+function isSerifFont(name: string): boolean {
+  const serifIndicators = /georgia|garamond|palatino|times|baskerville|cambria|didot|bodoni|caslon|minion|sabon|charter|merriweather|playfair|lora|libre\s*baskerville|source\s*serif|noto\s*serif|dm\s*serif|cormorant/i;
+  return serifIndicators.test(name);
 }
 
 function normalizeWeight(val: string): string {
@@ -396,26 +540,26 @@ function isGenericFont(name: string): boolean {
 
 // ── Exported extraction functions ────────────────────────────────
 
-export function extractLogoOnly(html: string, baseUrl: string, ogImage?: string): string | null {
-  return extractLogo(html, baseUrl, ogImage);
+export function extractLogoOnly(html: string, baseUrl: string, businessType: BusinessType, ogImage?: string): string | null {
+  return extractLogo(html, baseUrl, businessType, ogImage);
 }
 
-export function extractColorsOnly(html: string, externalCss: string): {
+export function extractColorsOnly(html: string, externalCss: string, businessType: BusinessType): {
   primaryColors: string[]; secondaryColors: string[]; accentColors: string[]; backgroundColors: string[];
 } {
-  const c = extractColors(html, externalCss);
+  const c = extractColors(html, externalCss, businessType);
   return { primaryColors: c.primary, secondaryColors: c.secondary, accentColors: c.accent, backgroundColors: c.background };
 }
 
-export function extractFontsOnly(html: string, externalCss: string): FontInfo[] {
-  return extractFonts(html, externalCss);
+export function extractFontsOnly(html: string, externalCss: string, businessType: BusinessType): FontInfo[] {
+  return extractFonts(html, externalCss, businessType);
 }
 
-export function extractBrandAssets(scrapeResult: ScrapeResult): BrandResult {
+export function extractBrandAssets(scrapeResult: ScrapeResult, businessType: BusinessType): BrandResult {
   const { html, finalUrl, metadata, externalCss } = scrapeResult;
-  const logoUrl = extractLogo(html, finalUrl, metadata?.og_image ?? undefined);
-  const colors = extractColors(html, externalCss);
-  const fonts = extractFonts(html, externalCss);
+  const logoUrl = extractLogo(html, finalUrl, businessType, metadata?.og_image ?? undefined);
+  const colors = extractColors(html, externalCss, businessType);
+  const fonts = extractFonts(html, externalCss, businessType);
 
   return {
     logoUrl,

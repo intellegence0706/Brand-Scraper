@@ -28,7 +28,7 @@ export async function POST(req: NextRequest) {
     const jobId = uuid();
     createJob(jobId, normalizedUrl, bType);
 
-    const promise = processJob(jobId, normalizedUrl).finally(() => {
+    const promise = processJob(jobId, normalizedUrl, bType).finally(() => {
       runningJobs.delete(jobId);
     });
     runningJobs.set(jobId, promise);
@@ -39,7 +39,7 @@ export async function POST(req: NextRequest) {
   }
 }
 
-async function processJob(jobId: string, url: string) {
+async function processJob(jobId: string, url: string, businessType: BusinessType) {
   try {
     updateJob(jobId, { status: "scraping" });
 
@@ -49,13 +49,13 @@ async function processJob(jobId: string, url: string) {
     updateJob(jobId, { status: "extracting" });
 
     // Phase 1: Logo — fast, show immediately
-    const logoUrl = extractLogoOnly(html, finalUrl, metadata?.og_image ?? undefined);
+    const logoUrl = extractLogoOnly(html, finalUrl, businessType, metadata?.og_image ?? undefined);
     updateJob(jobId, {
       partialResult: { logoUrl },
     });
 
     // Phase 2: Colors
-    const colors = extractColorsOnly(html, externalCss);
+    const colors = extractColorsOnly(html, externalCss, businessType);
     updateJob(jobId, {
       partialResult: {
         logoUrl,
@@ -64,7 +64,7 @@ async function processJob(jobId: string, url: string) {
     });
 
     // Phase 3: Fonts
-    const fonts = extractFontsOnly(html, externalCss);
+    const fonts = extractFontsOnly(html, externalCss, businessType);
     const result = {
       logoUrl,
       ...colors,
