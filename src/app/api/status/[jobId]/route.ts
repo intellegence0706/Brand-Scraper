@@ -18,6 +18,7 @@ export async function GET(
     status: job.status,
     result: job.result,
     partialResult: job.partialResult,
+    pagesScraped: job.pagesScraped,
     error: job.error,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,

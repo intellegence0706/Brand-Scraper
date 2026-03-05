@@ -1,6 +1,6 @@
-import type { Metadata } from "next";
+﻿import type { Metadata } from "next";
 import "./globals.css";
-import AnimatedBackground from "./AnimatedBackground";
+import AnimatedBackground from "@/components/layout/AnimatedBackground";
 
 export const metadata: Metadata = {
   title: "Brand Scraper",

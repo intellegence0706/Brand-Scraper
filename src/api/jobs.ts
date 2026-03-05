@@ -22,6 +22,7 @@ export interface Job {
   status: JobStatus;
   result: BrandResult | null;
   partialResult: Partial<BrandResult> | null;
+  pagesScraped: number;
   error: string | null;
   createdAt: number;
   updatedAt: number;
@@ -37,6 +38,7 @@ export function createJob(id: string, url: string, businessType: BusinessType): 
     status: "pending",
     result: null,
     partialResult: null,
+    pagesScraped: 0,
     error: null,
     createdAt: Date.now(),
     updatedAt: Date.now(),

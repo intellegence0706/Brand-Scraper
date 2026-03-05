@@ -6,104 +6,223 @@ import type { ScrapeResult } from "./scraper";
 function extractLogo(html: string, baseUrl: string, businessType: BusinessType, ogImageFromMeta?: string): string | null {
   const candidates: { url: string; score: number }[] = [];
 
-  if (ogImageFromMeta) {
-    candidates.push({ url: ogImageFromMeta, score: 12 });
-  }
+  // ── 1. Extract header/nav region for contextual scoring ────────
+  // Many logos live inside <header> or <nav> without "logo" in their attributes.
+  // We extract these regions once so we can check if an element falls inside them.
+  const headerNavRegions = extractHeaderNavRegions(html);
 
+  // ── 2. og:image — demoted to fallback ─────────────────────────
+  // og:image is usually a 1200x630 social sharing banner, not the logo.
+  // We still collect it but at a low score so real logos win.
+  if (ogImageFromMeta) {
+    const ogScore = looksLikeLogo(ogImageFromMeta) ? 8 : 3;
+    candidates.push({ url: ogImageFromMeta, score: ogScore });
+  }
   const ogPatterns = [
     /<meta[^>]+property=["']og:image["'][^>]+content=["']([^"']+)["']/i,
     /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image["']/i,
   ];
   for (const re of ogPatterns) {
     const m = html.match(re);
-    if (m && m[1]) { candidates.push({ url: m[1], score: 10 }); break; }
+    if (m && m[1]) {
+      const ogScore = looksLikeLogo(m[1]) ? 8 : 3;
+      candidates.push({ url: m[1], score: ogScore });
+      break;
+    }
   }
 
-  const linkIconRe = /<link[^>]+rel=["']([^"']*(icon|apple-touch-icon)[^"']*)["'][^>]*href=["']([^"']+)["'][^>]*>/gi;
-  let linkMatch;
-  while ((linkMatch = linkIconRe.exec(html)) !== null) {
-    const rel = linkMatch[1].toLowerCase();
-    const href = linkMatch[3];
-    let score = 3;
-    if (rel.includes("apple-touch-icon")) score = 6;
-    const sizeMatch = linkMatch[0].match(/sizes=["'](\d+)x(\d+)["']/i);
-    if (sizeMatch && parseInt(sizeMatch[1]) >= 128) score += 2;
-    candidates.push({ url: href, score });
-  }
-  const linkIconRe2 = /<link[^>]+href=["']([^"']+)["'][^>]*rel=["']([^"']*(icon|apple-touch-icon)[^"']*)["'][^>]*>/gi;
-  while ((linkMatch = linkIconRe2.exec(html)) !== null) {
-    const href = linkMatch[1];
-    const rel = linkMatch[2].toLowerCase();
-    let score = 3;
-    if (rel.includes("apple-touch-icon")) score = 6;
-    const sizeMatch = linkMatch[0].match(/sizes=["'](\d+)x(\d+)["']/i);
-    if (sizeMatch && parseInt(sizeMatch[1]) >= 128) score += 2;
-    candidates.push({ url: href, score });
+  // ── 3. Favicons / apple-touch-icons ───────────────────────────
+  // These are reliable logo sources — apple-touch-icon especially.
+  const linkIconPatterns = [
+    /<link[^>]+rel=["']([^"']*(icon|apple-touch-icon)[^"']*)["'][^>]*href=["']([^"']+)["'][^>]*>/gi,
+    /<link[^>]+href=["']([^"']+)["'][^>]*rel=["']([^"']*(icon|apple-touch-icon)[^"']*)["'][^>]*>/gi,
+  ];
+  for (const re of linkIconPatterns) {
+    let linkMatch;
+    while ((linkMatch = re.exec(html)) !== null) {
+      const fullTag = linkMatch[0];
+      // Figure out which capture group has rel vs href based on pattern
+      const isPattern1 = re.source.startsWith("<link[^>]+rel");
+      const rel = (isPattern1 ? linkMatch[1] : linkMatch[2]).toLowerCase();
+      const href = isPattern1 ? linkMatch[3] : linkMatch[1];
+
+      let score = 5;
+      if (rel.includes("apple-touch-icon")) score = 9;
+      if (/\.svg/i.test(href)) score += 2;
+      const sizeMatch = fullTag.match(/sizes=["'](\d+)x(\d+)["']/i);
+      if (sizeMatch) {
+        const size = parseInt(sizeMatch[1]);
+        if (size >= 180) score += 3;
+        else if (size >= 128) score += 2;
+        else if (size >= 64) score += 1;
+        // Tiny favicons (16x16, 32x32) are less useful
+        if (size <= 32) score -= 2;
+      }
+      candidates.push({ url: href, score });
+    }
   }
 
+  // ── 4. <img> tags — context-aware scoring ─────────────────────
   const imgRegex = /<img[^>]*>/gi;
   let imgMatch;
   while ((imgMatch = imgRegex.exec(html)) !== null) {
     const tag = imgMatch[0];
+    const tagOffset = imgMatch.index;
     const srcMatch = tag.match(/src=["']([^"']+)["']/i);
     if (!srcMatch) continue;
     const src = srcMatch[1];
-    if (src.startsWith("data:") && src.length < 100) continue;
+
+    // Skip tiny data URIs (tracking pixels)
+    if (src.startsWith("data:") && src.length < 200) continue;
+    // Skip obvious non-logo patterns
+    if (/avatar|profile|photo|banner|hero|background|bg[-_]/i.test(src)) continue;
+
     const tagLower = tag.toLowerCase();
     let score = 0;
-    if (/logo/i.test(tagLower)) score += 8;
-    if (/brand/i.test(tagLower)) score += 5;
-    if (/site[-_]?icon/i.test(tagLower)) score += 4;
-    if (/header/i.test(tagLower)) score += 2;
-    if (/\.svg/i.test(src)) score += 3;
-    const altMatch = tag.match(/alt=["']([^"']+)["']/i);
-    if (altMatch && /logo/i.test(altMatch[1])) score += 6;
-    const classMatch = tag.match(/class=["']([^"']+)["']/i);
-    if (classMatch && /logo/i.test(classMatch[1])) score += 5;
-    const idMatch = tag.match(/id=["']([^"']+)["']/i);
-    if (idMatch && /logo/i.test(idMatch[1])) score += 5;
 
-    // Business-type-specific logo scoring adjustments
+    // Keyword signals in the tag itself
+    if (/logo/i.test(tagLower)) score += 10;
+    if (/brand/i.test(tagLower)) score += 6;
+    if (/site[-_]?icon/i.test(tagLower)) score += 5;
+    if (/wordmark|logotype/i.test(tagLower)) score += 7;
+
+    // Check alt, class, id attributes specifically
+    const altMatch = tag.match(/alt=["']([^"']+)["']/i);
+    if (altMatch) {
+      if (/logo/i.test(altMatch[1])) score += 8;
+      if (/brand|company|site/i.test(altMatch[1])) score += 3;
+    }
+    const classMatch = tag.match(/class=["']([^"']+)["']/i);
+    if (classMatch) {
+      if (/logo/i.test(classMatch[1])) score += 7;
+      if (/brand/i.test(classMatch[1])) score += 4;
+      if (/navbar[-_]?brand/i.test(classMatch[1])) score += 8;
+    }
+    const idMatch = tag.match(/id=["']([^"']+)["']/i);
+    if (idMatch && /logo/i.test(idMatch[1])) score += 7;
+
+    // SVG format is a strong logo signal
+    if (/\.svg/i.test(src)) score += 4;
+    if (src.startsWith("data:image/svg")) score += 4;
+
+    // Context: is this image inside a header/nav region?
+    const inHeaderNav = headerNavRegions.some(
+      (r) => tagOffset >= r.start && tagOffset <= r.end
+    );
+    if (inHeaderNav) score += 6;
+
+    // Size heuristics from width/height attributes
+    const widthMatch = tag.match(/width=["']?(\d+)/i);
+    const heightMatch = tag.match(/height=["']?(\d+)/i);
+    if (widthMatch && heightMatch) {
+      const w = parseInt(widthMatch[1]);
+      const h = parseInt(heightMatch[1]);
+      // Logos are typically small-to-medium, roughly square or wide
+      if (w >= 40 && w <= 400 && h >= 20 && h <= 200) score += 3;
+      // Penalize huge images (hero banners)
+      if (w > 800 || h > 400) score -= 5;
+      // Penalize tiny tracking pixels
+      if (w <= 5 || h <= 5) score -= 10;
+    }
+
+    // Business-type-specific adjustments
     if (businessType === "products") {
-      // E-commerce: boost logos near cart/shop elements
-      if (/cart|shop|store|product/i.test(tagLower)) score += 3;
-      // Logos in nav/header are strong signals for e-commerce
-      if (/nav|header/i.test(tagLower)) score += 2;
+      if (/cart|shop|store/i.test(tagLower)) score += 2;
+      if (inHeaderNav) score += 2;
     } else if (businessType === "saas") {
-      // SaaS sites favor SVG logos heavily
-      if (/\.svg/i.test(src)) score += 4;
-      // Inline SVG data URIs are common in SaaS
-      if (src.startsWith("data:image/svg")) score += 3;
+      if (/\.svg/i.test(src) || src.startsWith("data:image/svg")) score += 3;
     } else if (businessType === "services") {
-      // Services sites often use text-based logos or wordmarks
-      // Boost images with "wordmark" or "text" in attributes
-      if (/wordmark|text[-_]?logo|logotype/i.test(tagLower)) score += 5;
-      // Header images are the strongest signal for services
-      if (/header/i.test(tagLower)) score += 3;
+      if (/wordmark|text[-_]?logo|logotype/i.test(tagLower)) score += 4;
+      if (inHeaderNav) score += 2;
     }
 
     if (score > 0) candidates.push({ url: src, score });
   }
 
-  // SaaS: also look for inline <svg> elements in the header area that might be logos
-  if (businessType === "saas") {
-    const headerSvgRe = /<(?:header|nav)[^>]*>[\s\S]{0,2000}?<svg[^>]*>([\s\S]*?)<\/svg>/gi;
+  // ── 5. Inline <svg> in header/nav — all business types ────────
+  // Many modern sites embed logos as inline SVGs, not just SaaS.
+  const headerSvgRe = /<(?:header|nav)[^>]*>([\s\S]{0,5000}?)<\/(?:header|nav)>/gi;
+  let regionMatch;
+  while ((regionMatch = headerSvgRe.exec(html)) !== null) {
+    const regionContent = regionMatch[1];
+    // Find SVGs within this region
+    const svgRe = /<svg[^>]*>[\s\S]*?<\/svg>/gi;
     let svgMatch;
-    while ((svgMatch = headerSvgRe.exec(html)) !== null) {
-      // Found an SVG in header/nav — encode as data URI candidate
-      const svgContent = svgMatch[0].match(/<svg[^>]*>[\s\S]*?<\/svg>/i);
-      if (svgContent) {
-        const encoded = `data:image/svg+xml,${encodeURIComponent(svgContent[0])}`;
-        candidates.push({ url: encoded, score: 9 });
-      }
+    while ((svgMatch = svgRe.exec(regionContent)) !== null) {
+      const svgTag = svgMatch[0];
+      // Skip tiny decorative SVGs (arrows, chevrons, hamburger menus)
+      if (svgTag.length < 100) continue;
+      // Skip if it looks like a generic icon (very few path elements, tiny viewBox)
+      const pathCount = (svgTag.match(/<path/gi) || []).length;
+      if (pathCount === 0) continue;
+
+      let svgScore = 8;
+      // Boost if the SVG or its parent has logo-related attributes
+      if (/logo|brand/i.test(svgTag)) svgScore += 5;
+      // Boost for complex SVGs (more paths = more likely a logo, not an icon)
+      if (pathCount >= 3) svgScore += 2;
+      if (businessType === "saas") svgScore += 3;
+
+      const encoded = `data:image/svg+xml,${encodeURIComponent(svgTag)}`;
+      candidates.push({ url: encoded, score: svgScore });
+    }
+  }
+
+  // ── 6. <a> tags wrapping images in header (common pattern) ────
+  // Pattern: <a href="/"><img src="logo.png"></a> inside header
+  for (const region of headerNavRegions) {
+    const regionHtml = html.slice(region.start, region.end);
+    const linkImgRe = /<a[^>]*href=["']\/["'][^>]*>[\s\S]{0,500}?<img[^>]+src=["']([^"']+)["'][^>]*>/gi;
+    let lm;
+    while ((lm = linkImgRe.exec(regionHtml)) !== null) {
+      const src = lm[1];
+      if (src.startsWith("data:") && src.length < 200) continue;
+      // An image linked to "/" inside header is almost certainly the logo
+      let score = 12;
+      if (/\.svg/i.test(src)) score += 2;
+      candidates.push({ url: src, score });
     }
   }
 
   if (!candidates.length) return null;
-  candidates.sort((a, b) => b.score - a.score);
-  const best = candidates[0].url;
+
+  // Deduplicate by URL, keeping highest score
+  const urlMap = new Map<string, number>();
+  for (const c of candidates) {
+    const existing = urlMap.get(c.url) ?? 0;
+    if (c.score > existing) urlMap.set(c.url, c.score);
+  }
+  const deduped = [...urlMap.entries()]
+    .map(([url, score]) => ({ url, score }))
+    .sort((a, b) => b.score - a.score);
+
+  const best = deduped[0].url;
   if (best.startsWith("data:") || best.startsWith("http")) return best;
   try { return new URL(best, baseUrl).href; } catch { return best; }
+}
+
+/** Check if a URL looks like it could be a logo (vs a social banner) */
+function looksLikeLogo(url: string): boolean {
+  return /logo|icon|brand|favicon/i.test(url) || /\.svg/i.test(url);
+}
+
+/** Extract start/end offsets of <header> and <nav> regions */
+function extractHeaderNavRegions(html: string): { start: number; end: number }[] {
+  const regions: { start: number; end: number }[] = [];
+  const re = /<(header|nav)\b[^>]*>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const tagName = m[1].toLowerCase();
+    const closeRe = new RegExp(`</${tagName}>`, "i");
+    const closeMatch = closeRe.exec(html.slice(m.index));
+    if (closeMatch) {
+      regions.push({
+        start: m.index,
+        end: m.index + closeMatch.index + closeMatch[0].length,
+      });
+    }
+  }
+  return regions;
 }
 
 // ── Color utilities ──────────────────────────────────────────────

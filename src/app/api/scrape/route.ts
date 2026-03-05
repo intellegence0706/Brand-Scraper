@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { v4 as uuid } from "uuid";
 import { createJob, updateJob, BusinessType } from "@/api/jobs";
-import { scrapeUrl } from "@/lib/scraper";
+import { scrapeMultiplePages } from "@/lib/scraper";
 import { extractLogoOnly, extractColorsOnly, extractFontsOnly } from "@/lib/extractor";
 
 const runningJobs = new Map<string, Promise<void>>();
@@ -43,19 +43,20 @@ async function processJob(jobId: string, url: string, businessType: BusinessType
   try {
     updateJob(jobId, { status: "scraping" });
 
-    const scrapeResult = await scrapeUrl(url);
-    const { html, finalUrl, metadata, externalCss } = scrapeResult;
+    const multiResult = await scrapeMultiplePages(url, businessType);
+    const { primary, subpages, mergedHtml, mergedCss } = multiResult;
+    const metadata = primary.metadata;
 
-    updateJob(jobId, { status: "extracting" });
+    updateJob(jobId, { status: "extracting", pagesScraped: 1 + subpages.length });
 
-    // Phase 1: Logo — fast, show immediately
-    const logoUrl = extractLogoOnly(html, finalUrl, businessType, metadata?.og_image ?? undefined);
+    // Phase 1: Logo — use primary page for logo (most reliable source)
+    const logoUrl = extractLogoOnly(primary.html, primary.finalUrl, businessType, metadata?.og_image ?? undefined);
     updateJob(jobId, {
       partialResult: { logoUrl },
     });
 
-    // Phase 2: Colors
-    const colors = extractColorsOnly(html, externalCss, businessType);
+    // Phase 2: Colors — use merged HTML/CSS from all pages
+    const colors = extractColorsOnly(mergedHtml, mergedCss, businessType);
     updateJob(jobId, {
       partialResult: {
         logoUrl,
@@ -63,8 +64,8 @@ async function processJob(jobId: string, url: string, businessType: BusinessType
       },
     });
 
-    // Phase 3: Fonts
-    const fonts = extractFontsOnly(html, externalCss, businessType);
+    // Phase 3: Fonts — use merged HTML/CSS from all pages
+    const fonts = extractFontsOnly(mergedHtml, mergedCss, businessType);
     const result = {
       logoUrl,
       ...colors,

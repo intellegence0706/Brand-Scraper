@@ -10,3 +10,11 @@
   }
   a { @apply text-violet-400 no-underline hover:underline; }
 }
+
+/* ── Shared keyframes ──────────────────────────────────────── */
+@keyframes fadeInUp { from { opacity: 0; transform: translateY(16px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes spinLoader { to { transform: rotate(360deg); } }
+@keyframes pulseRing { 0%, 100% { box-shadow: 0 0 0 0 rgba(139,92,246,0.4); } 50% { box-shadow: 0 0 0 8px transparent; } }
+@keyframes glowDot { 0%, 100% { opacity: 0.5; } 50% { opacity: 1; } }
+@keyframes glowPulse { 0%, 100% { opacity: 0.3; } 50% { opacity: 0.6; } }
+@keyframes slideIn { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
